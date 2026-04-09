@@ -83,6 +83,16 @@ streamlit run app.py
 .venv\Scripts\streamlit.exe run app.py
 ```
 
+### 🔧 Troubleshooting: AI Engine Initializing on CPU
+The CineMatch AI engine is designed to **use your GPU (CUDA) automatically** if available. If the application states it is loading the engine on the CPU, PyTorch could not detect a compatible GPU setup. This typically happens if the standard CPU version of PyTorch was installed, or if your Python version lacks pre-compiled GPU binaries.
+
+To fix this and force hardware acceleration (NVIDIA GPUs only), run the following commands in your virtual environment:
+```bash
+pip uninstall torch torchvision torchaudio -y
+pip install -r requirements.txt
+```
+*(Our `requirements.txt` specifically targets the CUDA 12.1 enabled binaries).*
+
 ---
 
 ## 🛠️ Tech Stack
