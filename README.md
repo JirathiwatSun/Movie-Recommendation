@@ -7,28 +7,26 @@ CineMatch 2.0 is an advanced content-based recommendation engine built with **St
 
 ---
 
-## 🚀 Key Features (CineMatch 2.0)
+## 🚀 Key Features (CineMatch Oracle Edition)
 
-### 🧠 AI Semantic "Vibe" Search
-- Leverages **Sentence Transformers** (`all-MiniLM-L6-v2`) to perform natural language interpretation of movie plots and synopses.
-- Search for "vibes" rather than just titles (e.g., *"lonely space travel"* or *"gritty urban survival"*).
+### 🧠 CineMatch Oracle 🔮
+- **Intent-Based Discovery**: The engine now understands the "Soul" of your search. It detects if you want **Visual Style** (Neon, Noir), **Emotional Impact** (Heartbreaking, Happy), or **Narrative Complexity** (Twists, Plot).
+- **Synonym Intelligence**: Integrated **NLTK WordNet** to expand queries. Searching for "Astronaut" automatically discovers "Space," "Galaxy," and "NASA" connections.
+
+### ⚡ Mood Fusion Engine
+- **Thematic Overlaps**: Finds movies that sit at the intersection of multiple vibes (e.g., *"Beautiful [Visual] but Sad [Emotional]"*).
+- **Fusion Scoring**: Prioritizes "Resonance" matches where every part of a complex query is satisfied.
+
+### 💎 Hidden Gem Radar
+- **Critic's Darlings**: Automatically surfaces highly-rated independent films (>8.0 IMDB) with lower vote counts that might otherwise be buried by blockbusters.
+- **Fair Discovery**: Implements **Short-Overview Hydration** to ensure indie films with brief descriptions have a strong "Vibe Signal."
+
+### 🏗️ Global Quality Priority
+- **Strict IMDB Ranking**: All semantic matches are globally sorted from highest to lowest quality. Page 1 always contains the "Best of the Best."
+- **Unlimited Scanning**: The search engine now scans the entire **436k movie dataset** without retrieval caps.
 
 ### 🕸️ 3D Cinematic Discovery Explorer
-- Interactive **Plotly 3D Network Graph** visualizing the relationships between 10,000+ movies.
-- Explore movie clusters and "bridges" between genres in a dynamic 3D space.
-
-### ⚖️ Weighted Statistical Ranking
-- Implements the **IMDB Weighted Rating formula** to ensure global quality standards.
-- Balances vote volume against average ratings to highlight objective "Viral Hits" and "All-Time Classics."
-
-### 📂 Hybrid Watchlist Discovery
-- Personalized recommendation engine that aggregates the "Cinematic DNA" of your entire watchlist.
-- Discovers the perfect "next watch" by cross-referencing multiple movie affinities simultaneously.
-
-### 🎨 Premium Cinematic UI
-- **Glassmorphic Design**: Modern dark-mode interface with translucent cards and smooth transitions.
-- **Dynamic Detail Panels**: Auto-navigating movie details that rise to the top for a seamless browsing experience.
-- **Auto-Poster Discovery**: Multi-stage fallback system ensuring every movie has a visual poster, even for obscure titles.
+- Interactive **Plotly 3D Network Graph** visualizing relationships between 436,000+ movies.
 
 ---
 

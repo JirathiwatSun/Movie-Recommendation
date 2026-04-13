@@ -52,7 +52,7 @@ try:
 except ImportError:
     MATPLOTLIB_AVAILABLE = False
 
-from nltk.corpus import stopwords
+from nltk.corpus import stopwords, wordnet
 from nltk.stem import WordNetLemmatizer
 
 warnings.filterwarnings("ignore")
@@ -80,6 +80,12 @@ TMDB_API_KEY = "f0c9a17755aeb5fcb556bd2b1f701032"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w300"
 TMDB_API_BASE = "https://api.themoviedb.org/3"
 POSTER_PLACEHOLDER = "🎬"
+MODELS_DIR = "models"
+PROCESSED_DF_PATH = os.path.join(MODELS_DIR, "processed_df.pkl")
+EMBEDDINGS_PATH = os.path.join(MODELS_DIR, "embeddings.pt")
+
+os.makedirs(MODELS_DIR, exist_ok=True)
+
 
 ALL_GENRES = [
     "Action", "Adventure", "Animation", "Comedy", "Crime",
@@ -118,6 +124,12 @@ def clean_text(text):
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
 def load_and_process_data():
+    if os.path.exists(PROCESSED_DF_PATH):
+        try:
+            return pd.read_pickle(PROCESSED_DF_PATH)
+        except Exception:
+            pass
+
     try:
         df = pd.read_csv("archive/TMDB_IMDB_Movies_Dataset.csv", low_memory=False)
     except FileNotFoundError:
@@ -125,35 +137,44 @@ def load_and_process_data():
 
     # IMDB Weighted Rating formula
     # We restrict this to the top 20,000 movies to prevent computer lag
-    m = df["vote_count"].quantile(0.1)  
+    # Include ALL movies as requested
+    # We set m to 0 to ensure every movie is considered
+    m = 0
     C = df["vote_average"].mean()
 
     def weighted_rating(x):
         v = x["vote_count"]
         R = x["vote_average"]
+        if v + m == 0: return R
         return (v / (v + m)) * R + (m / (v + m)) * C
 
-    q_movies = df[df["vote_count"] >= m].copy()
+    # Filter is essentially disabled by setting m=0
+    q_movies = df.copy()
     q_movies["score"] = q_movies.apply(weighted_rating, axis=1)
     
-    # Drop duplicates BEFORE the cutoff to ensure we reach the full 50,000 unique movie target
-    unique_movies = q_movies.drop_duplicates(subset="title")
+    # Drop duplicates by ID to preserve remakes but remove data redundancies
+    unique_movies = q_movies.drop_duplicates(subset="id")
     
-    # Take the top 50,000 highest-scored unique movies
-    top_voted = unique_movies.sort_values("score", ascending=False).head(50000)
+    # Removed .head(50000) to include maximum movies from dataset
+    top_voted = unique_movies.sort_values("score", ascending=False)
     
-    # Also ensure any 2025 releases are included (future-proofing)
+    # Also ensure any 2025 releases are included
     latest_2025 = unique_movies[unique_movies["release_date"].str.contains("2025", na=False)]
     
-    # Combine and finalise the model dataframe
-    df_model = pd.concat([top_voted, latest_2025]).drop_duplicates(subset="title").reset_index(drop=True)
+    # Combine and finalise the model dataframe (using ID for uniqueness)
+    df_model = pd.concat([top_voted, latest_2025]).drop_duplicates(subset="id").reset_index(drop=True)
+    
+    # Generate unique display labels for search (handles remakes)
+    df_model["display_title"] = df_model["title"] + " (" + df_model["release_date"].fillna("").str[:4] + ")"
+    df_model["display_title"] = df_model["display_title"].str.replace(" ()", "", regex=False)
 
-    # Parse release year
+    # Parse release year (Capped at 2026 to filter dirty future data)
     df_model["release_year"] = (
         pd.to_datetime(df_model["release_date"], errors="coerce")
         .dt.year.fillna(0)
         .astype(int)
     )
+    df_model.loc[df_model["release_year"] > 2026, "release_year"] = 0
 
     # Ensure categorical columns exist (new dataset compat)
     for feat in ["genres", "keywords", "cast", "directors", "overview"]:
@@ -172,21 +193,67 @@ def load_and_process_data():
     for feat in ["cast", "directors"]:
         df_model[feat] = df_model[feat].fillna("").str.title()
 
-    # Build soup (Apply space-removal LOCALLY for the AI engine only)
-    df_model["soup"] = (
-        df_model["overview"] + " "
-        + df_model["genres"] + " "
-        + df_model["keywords"] + " "
-        + df_model["cast"].str.lower().str.replace(" ", "", regex=False) + " "
+    # 🕵️ ERA TAGGING (Adds Chronological Vibe Context)
+    def get_era_tags(year):
+        if year == 0: return ""
+        if 1920 <= year < 1960: return "golden age classic vintage oldie"
+        if 1960 <= year < 1980: return "retro classic seventies sixties"
+        if 1980 <= year < 1990: return "eighties 80s retro synth nostalgic"
+        if 1990 <= year < 2000: return "nineties 90s classic"
+        if 2000 <= year < 2010: return "modern 2000s"
+        if 2010 <= year < 2020: return "modern 2010s"
+        if 2020 <= year <= 2026: return "latest modern 2020s"
+        return ""
+    
+    df_model["era_soup"] = df_model["release_year"].apply(get_era_tags)
+
+    # 🥣 HIGH-SIGNAL SOUP (The "Brain" of the AI)
+    # 🧪 PERFECTIONIST FIX: Short-Overview Hydration
+    # We handle short overviews by "hydrating" them with extra thematic signals.
+    overview_len = df_model["overview"].str.len()
+    short_mask = overview_len < 60
+    
+    base_soup = (
+        (df_model["title"].str.lower() + " ") * 2        # Boost Title
+        + df_model["overview"] + " "
+        + (df_model["genres"] + " ") * 2               # Boost Genres
+        + (df_model["keywords"] + " ") * 3             # Boost Keywords (Primary signal)
+        + df_model["era_soup"] + " "                   
+    )
+    
+    df_model["soup"] = base_soup
+    # Inject extra hydration for silent/short-overview films
+    df_model.loc[short_mask, "soup"] += (df_model.loc[short_mask, "genres"] + " ") * 3
+    df_model.loc[short_mask, "soup"] += (df_model.loc[short_mask, "keywords"] + " ") * 3
+    
+    df_model["soup"] += (
+        df_model["cast"].str.lower().str.replace(" ", "", regex=False) + " "
         + df_model["directors"].str.lower().str.replace(" ", "", regex=False)
     )
+
+
 
     if "poster_path" not in df_model.columns:
         df_model["poster_path"] = ""
     else:
         df_model["poster_path"] = df_model["poster_path"].fillna("")
 
+    # Performance Patch: Pre-sort for instant search box performance
+    df_model = df_model.sort_values("score", ascending=False).reset_index(drop=True)
+    
+    # Pre-lower for lightning search
+    df_model["display_title_lower"] = df_model["display_title"].str.lower()
+
+    # Save for persistence
+    try:
+        df_model.to_pickle(PROCESSED_DF_PATH)
+    except Exception:
+        pass
+
     return df_model
+
+
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # EMBEDDINGS & SIMILARITIES  (GPU-accelerated)
@@ -204,13 +271,24 @@ def compute_embeddings(_df_model):
     """
     Core AI logic with progress tracking.
     This function will be called whenever embeddings are needed and not cached.
+    Supports loading from disk for persistence.
     """
     if not SENTENCE_TRANSFORMER_AVAILABLE:
         return None
     
+    # Try to load from disk first
+    if os.path.exists(EMBEDDINGS_PATH):
+        try:
+            with st.status("📦 Loading Pre-trained AI Engine...", expanded=False) as status:
+                embeddings = torch.load(EMBEDDINGS_PATH, map_location=CUDA_DEVICE)
+                status.update(label="✅ AI Engine Loaded from Disk!", state="complete")
+                return embeddings
+        except Exception:
+            pass
+
     with st.container():
         # ── INITIALIZATION UI (First Run Only) ───────────────────────────────
-        with st.status("🚀 CineMatch AI Initialization", expanded=True) as status:
+        with st.status("🚀 CineMatch AI Initialization (First Run Only)", expanded=True) as status:
             gpu_name = f" ({torch.cuda.get_device_name(0)})" if CUDA_DEVICE == "cuda" else ""
             st.write(f"📡 Loading SentenceTransformer engine on {CUDA_DEVICE.upper()}{gpu_name}...")
             model = _get_sentence_transformer_model()
@@ -238,14 +316,21 @@ def compute_embeddings(_df_model):
                 
                 # Update Streamlit Progress
                 current_pct = end_idx / total_movies
-                progress_bar.progress(current_pct, text=f"Vectorised: {end_idx:,} / {total_movies:,}")
+                progress_bar.progress(current_pct, text=f"Scanning fingerprints: {end_idx:,} / {total_movies:,}")
                 
             # Combine batches into a single GPU resident tensor
             embeddings = torch.cat(all_embeddings)
             
-            status.update(label="✅ AI Engine Loaded & Residing in VRAM!", state="complete", expanded=False)
+            # Save for persistence
+            try:
+                torch.save(embeddings, EMBEDDINGS_PATH)
+            except Exception:
+                pass
+            
+            status.update(label="✅ AI Engine Initialized & Saved to Disk!", state="complete", expanded=False)
             
     return embeddings
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TMDB POSTER FETCH
@@ -354,7 +439,7 @@ def apply_unified_filters(df, genre_filter=None, min_rating=0.0, min_year=1900, 
 
 def get_semantic_recommendations(query, embeddings, df_model, top_n=10, 
                                  genre_filter=None, min_rating=0.0, min_year=1900, max_year=2025):
-    """Finds movies matching a natural language vibe query while respecting filters."""
+    """Finds movies matching a natural language vibe query using Hybrid Scoring (Semantic + Quality)."""
     if not SENTENCE_TRANSFORMER_AVAILABLE or embeddings is None:
         return pd.DataFrame()
         
@@ -370,35 +455,171 @@ def get_semantic_recommendations(query, embeddings, df_model, top_n=10,
     else:
         return pd.DataFrame()
     
-    # Attach scores to a fresh copy
+    # 🧬 HYBRID SCORING ENGINE
+    # We combine Semantic Similarity (50%) with the Movie's Popularity/Rating Score (50%)
     df_temp = df_model.copy()
-    df_temp["similarity_score"] = sims
+    
+    # Use a float64 Series to prevent dtype-mismatch errors during assignment
+    similarity_col = pd.Series(sims, index=df_temp.index).astype(float)
+    
+    # 🚀 KEYWORD BOOSTING (e.g., handles 'Astronaut', 'Space')
+    # To maintain speed on 436k rows, we only apply the detailed keyword boost
+    # to the Top 2000 semantic matches.
+    # Use sims to find top indices directly since index is range(N)
+    top_pos = np.argsort(sims)[::-1][:2000]
+    top_indices = df_temp.index[top_pos]
+    
+    # 🧠 SYNONYM EXPANSION (Concept Intelligence)
+    # We find related terms (e.g., 'Astronaut' -> 'Space', 'NASA', 'Cosmonaut')
+    # to ensure the AI doesn't just look for literal words.
+    base_query_words = set(re.findall(r'\w+', query.lower()))
+    expanded_query_words = set()
+    for word in base_query_words:
+        if len(word) > 2:
+            expanded_query_words.add(word)
+            syns = wordnet.synsets(word)
+            for syn in syns[:3]: # Limit to top 3 synsets for relevance
+                for l in syn.lemmas()[:3]:
+                    expanded_query_words.add(l.name().lower().replace("_", " "))
+    
+    def calculate_keyword_boost(row):
+        boost = 0.0
+        # Title boost (Literal remains priority)
+        title_lower = str(row.get("display_title_lower",""))
+        if any(w in title_lower for w in base_query_words if len(w) > 2): boost += 0.05
+        
+        # Keywords/Genre boost (Expanded set for "related" concepts)
+        meta_words = (str(row.get("keywords","")) + " " + str(row.get("genres",""))).lower()
+        if any(w in meta_words for w in expanded_query_words if len(w) > 2): boost += 0.05
+        return boost
+
+    # Apply boost only to candidates in a type-safe way
+    boosts = df_temp.loc[top_indices].apply(calculate_keyword_boost, axis=1)
+    similarity_col.loc[top_indices] += boosts
+    
+    # ⚡ MOOD FUSION INTENT PARSER (Multi-Layer Understanding)
+    vis_set = {"neon", "noir", "visual", "aesthetic", "colorful", "gritty", "realistic", "cinematography"}
+    emo_set = {"heartbreaking", "sad", "happy", "powerful", "emotional", "tragedy", "tear", "inspiring", "lonely"}
+    narr_set = {"twist", "plot", "story", "complex", "mystery", "linear", "puzzle", "narrative"}
+    
+    detected_intents = []
+    if expanded_query_words & vis_set: detected_intents.append("Visual")
+    if expanded_query_words & emo_set: detected_intents.append("Emotional")
+    if expanded_query_words & narr_set: detected_intents.append("Narrative")
+    
+    # Apply Intent-Based Weighting (Fine-tuning the vibe scores)
+    for itent_name in detected_intents:
+        if itent_name == "Visual":
+            similarity_col += (df_temp["keywords"].str.contains("|".join(vis_set), na=False) * 0.03)
+        if itent_name == "Emotional":
+            similarity_col += (df_temp["overview"].str.contains("|".join(emo_set), na=False) * 0.03)
+        if itent_name == "Narrative":
+            similarity_col += (df_temp["keywords"].str.contains("|".join(narr_set), na=False) * 0.03)
+
+    # 🧬 PERFECTIONIST FIX: Genre Harmony Alignment
+    # If the vibe implies a genre (e.g. 'Space' -> 'Sci-Fi'), we nudge matching genres
+    harmony_map = {
+        "Visual": ["fiction", "fantasy", "horror", "action"],
+        "Emotional": ["drama", "romance", "documentary"],
+        "Narrative": ["thriller", "mystery", "crime"]
+    }
+    for itent in detected_intents:
+        if itent in harmony_map:
+            h_mask = df_temp["genres"].str.contains("|".join(harmony_map[itent]), case=False, na=False)
+            similarity_col[h_mask] += 0.01
+
+    # 🎭 MOOD FUSION RESONANCE (Intersection Boost)
+    # If a movie matches 2+ intents, it receives a 'Resonance Booster'
+    if len(detected_intents) > 1:
+        match_count = pd.Series(0, index=df_temp.index)
+        if "Visual" in detected_intents: match_count += df_temp["keywords"].str.contains("|".join(vis_set), na=False).astype(int)
+        if "Emotional" in detected_intents: match_count += df_temp["overview"].str.contains("|".join(emo_set), na=False).astype(int)
+        if "Narrative" in detected_intents: match_count += df_temp["keywords"].str.contains("|".join(narr_set), na=False).astype(int)
+        
+        resonance_boost = (match_count >= len(detected_intents)).astype(float) * 0.05
+        similarity_col += resonance_boost
+
+    df_temp["similarity_score"] = similarity_col.clip(upper=1.0)
+    
+    # Global Quality Hybrid
+    df_temp["hybrid_score"] = (df_temp["similarity_score"] * 0.5) + ((df_temp["score"] / 10.0) * 0.5)
     
     # Apply filters
     filtered_df = apply_unified_filters(df_temp, genre_filter, min_rating, min_year, max_year)
     
-    # Re-sort and take top N
-    result_df = filtered_df.sort_values("similarity_score", ascending=False).head(top_n)
-    result_df["xai_reason"] = "✨ Matches your requested vibe"
+    # 🧬 GLOBAL QUALITY FILTERING (Best IMDB strictly for all Relevant matches)
+    relevance_threshold = 0.32
+    relevant_matches = filtered_df[filtered_df["similarity_score"] > relevance_threshold].copy()
+    
+    # 💎 HIDDEN GEM RADAR (Discovering overlooked masterpieces)
+    def get_gem_boost(row):
+        votes = row.get("numVotes", 0)
+        rating = row.get("averageRating", 0)
+        if 200 < votes < 40000 and rating >= 7.8:
+            return 0.05 
+        return 0.0
+
+    if not relevant_matches.empty:
+        relevant_matches["score_for_gems"] = relevant_matches.apply(get_gem_boost, axis=1)
+        relevant_matches["averageRating"] += relevant_matches["score_for_gems"]
+
+    # Fallback: If too few results are found at high threshold, relax it to 0.25
+    if len(relevant_matches) < 12:
+        relevant_matches = filtered_df[filtered_df["similarity_score"] > 0.25]
+
+    # Global Sort by Strict IMDB rating + Gem Boost (Quality-First Discovery)
+    result_df = relevant_matches.sort_values("averageRating", ascending=False).head(500)
+
+    # 🔮 TRANSPARENT AI (XAI)
+    # Explain why the Oracle picked these movies
+    def generate_vibe_reason(row):
+        score_pct = int(min(0.99, row["similarity_score"]) * 100)
+        # Revert rating boost for display
+        rating_val = float(row.get("averageRating") - row.get("score_for_gems", 0) if "score_for_gems" in row else row.get("averageRating", 0))
+        
+        # Detect if it's a literal match or a related concept
+        meta = (str(row.get("keywords","")) + " " + str(row.get("genres","")) + " " + str(row.get("display_title_lower",""))).lower()
+        q_words = set(re.findall(r'\w+', query.lower()))
+        literal_found = [w.capitalize() for w in q_words if w in meta and len(w) > 2]
+        
+        # Oracle Fusion Badge
+        if len(detected_intents) > 1:
+            prefix = f"⚡ Fusion: {score_pct}%"
+        elif len(detected_intents) == 1:
+            prefix = f"🔮 {detected_intents[0]}: {score_pct}%"
+        else:
+            prefix = f"🔮 Oracle: {score_pct}%"
+            
+        if row.get("score_for_gems", 0) > 0:
+            prefix = f"💎 Gem: {score_pct}%"
+
+        reason = f"{prefix} • ⭐ {rating_val:.1f}"
+        if literal_found:
+            reason += f" • 🚀 {', '.join(literal_found[:2])}"
+        return reason
+
+    result_df["xai_reason"] = result_df.apply(generate_vibe_reason, axis=1)
     return result_df.reset_index(drop=True)
+
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RECOMMENDATION ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
 def get_recommendations(
-    title, df_model, embeddings, top_n=10,
+    display_title, df_model, embeddings, top_n=10,
     genre_filter=None, min_rating=0.0, min_year=1900, max_year=2025,
     focus="Balanced",
 ):
     """
     Computes similarity on-the-fly for the current movie to save memory.
     """
-    indices = pd.Series(df_model.index, index=df_model["title"]).drop_duplicates()
-    if title not in indices:
+    indices = pd.Series(df_model.index, index=df_model["display_title"]).drop_duplicates()
+    if display_title not in indices:
         return pd.DataFrame()
 
-    idx = indices[title]
+    idx = indices[display_title]
     
     # ⚡ GPU-RESIDENT SIMILARITY Logic
     if CUDA_DEVICE == "cuda" and TORCH_AVAILABLE and isinstance(embeddings, torch.Tensor):
@@ -414,13 +635,15 @@ def get_recommendations(
         from sklearn.metrics.pairwise import cosine_similarity
         sim_row = cosine_similarity(target_embedding, embeddings).flatten()
 
+    # KNN Performance Slicing: Only apply heavy focus weighting to Top 10,000 matches
     sim_scores = sorted(enumerate(sim_row), key=lambda x: float(x[1]), reverse=True)
-    sim_scores = [s for s in sim_scores if s[0] != idx]
+    sim_scores = [s for s in sim_scores if s[0] != idx][:10000]
 
     row_seed = df_model.iloc[idx]
-    seed_genres = set(str(row_seed.get("genres", "")).split(","))
-    seed_directors = set(str(row_seed.get("directors", "")).split("|"))
-    seed_keywords = set(str(row_seed.get("keywords", "")).split(","))
+    # Robust splitting using regex specifically for multi-delimiter datasets
+    seed_genres = {g.strip() for g in re.split(r'[\|,]', str(row_seed.get("genres", ""))) if g.strip() and g.strip().lower() != "nan"}
+    seed_directors = {d.strip() for d in re.split(r'[\|,]', str(row_seed.get("directors", ""))) if d.strip() and d.strip().lower() != "nan"}
+    seed_keywords = {k.strip() for k in re.split(r'[\|,]', str(row_seed.get("keywords", ""))) if k.strip() and k.strip().lower() != "nan"}
 
     # Prepare for focus weighting
     adjusted_scores = []
@@ -430,12 +653,12 @@ def get_recommendations(
         # Focus Weighting Logic
         final_score = float(score)
         if focus == "Director":
-            row_directors = set(str(row.get("directors", "")).split("|"))
-            if any(d in row_directors for d in seed_directors if len(d) > 1):
+            row_directors = {d.strip() for d in re.split(r'[\|,]', str(row.get("directors", ""))) if d.strip() and d.strip().lower() != "nan"}
+            if any(d in row_directors for d in seed_directors):
                 final_score += 0.2
         elif focus == "Genre":
-            row_genres = set(str(row.get("genres", "")).split(","))
-            if any(g in row_genres for g in seed_genres if len(g) > 1):
+            row_genres = {g.strip() for g in re.split(r'[\|,]', str(row.get("genres", ""))) if g.strip() and g.strip().lower() != "nan"}
+            if any(g in row_genres for g in seed_genres):
                 final_score += 0.1
         
         adjusted_scores.append((i, final_score))
@@ -459,16 +682,22 @@ def get_recommendations(
                 continue
         
         # XAI Logic: Why was this movie recommended?
-        row_genres = set(str(row.get("genres", "")).split(","))
-        row_directors = set(str(row.get("directors", "")).split("|"))
-        row_keywords = set(str(row.get("keywords", "")).split(","))
+        # Intent-Aware XAI: Prioritize reason matching the current focus mode
+        row_genres = {g.strip() for g in re.split(r'[\|,]', str(row.get("genres", ""))) if g.strip() and g.strip().lower() != "nan"}
+        row_directors = {d.strip() for d in re.split(r'[\|,]', str(row.get("directors", ""))) if d.strip() and d.strip().lower() != "nan"}
+        row_keywords = {k.strip() for k in re.split(r'[\|,]', str(row.get("keywords", ""))) if k.strip() and k.strip().lower() != "nan"}
         
-        common_dirs = [d for d in (seed_directors & row_directors) if len(d) > 1]
-        common_genres = [g for g in (seed_genres & row_genres) if len(g) > 1]
-        common_keys = [k for k in (seed_keywords & row_keywords) if len(k) > 1]
-        
+        common_dirs = list(seed_directors & row_directors)
+        common_genres = list(seed_genres & row_genres)
+        common_keys = list(seed_keywords & row_keywords)
+
         reason = ""
-        if common_dirs:
+        if focus == "Director" and common_dirs:
+            reason = f"🎬 Shared Director: {', '.join(common_dirs[:2])}"
+        elif focus == "Genre" and common_genres:
+            reason = f"🎭 Shared Genres: {', '.join(common_genres[:3])}"
+        # Default priority fallback
+        elif common_dirs:
             reason = f"🎬 Shared Director: {', '.join(common_dirs[:2])}"
         elif len(common_keys) >= 2:
             reason = f"🧠 Similar themes: {', '.join(common_keys[:3])}"
@@ -513,7 +742,7 @@ def get_watchlist_recommendations(watchlist_titles, df_model, embeddings, top_n=
     """
     if not watchlist_titles or embeddings is None:
         return pd.DataFrame()
-    indices = pd.Series(df_model.index, index=df_model["title"]).drop_duplicates()
+    indices = pd.Series(df_model.index, index=df_model["display_title"]).drop_duplicates()
     valid = [t for t in watchlist_titles if t in indices]
     if not valid:
         return pd.DataFrame()
@@ -553,7 +782,7 @@ def render_network_graph(center_movie_title, recommendations_df):
         return
     
     # Create nodes
-    names = [center_movie_title] + recommendations_df["title"].tolist()
+    names = [center_movie_title] + recommendations_df["display_title"].tolist()
     scores = [1.0] + recommendations_df["similarity_score"].tolist()
     
     # Simple sphere/orbit layout
@@ -620,14 +849,19 @@ def render_movie_detail_panel(row, df_model, embeddings_list):
     """Deep dive panel for a selected movie with internal sim calculations."""
     if row is None:
         return
-    title = str(row.get("title", "Unknown"))
+    title = str(row.get("display_title", "Unknown"))
     rating_col = "averageRating" if "averageRating" in df_model.columns else "vote_average"
     rating = float(row.get(rating_col, 0))
     year = int(row.get("release_year", 0))
-    genres = str(row.get("genres", ""))
-    overview = str(row.get("overview", ""))
-    directors = str(row.get("directors", "N/A"))
-    cast = str(row.get("cast", "N/A"))
+    # Safeguard against NaN values in string fields
+    def get_safe_str(val, fallback=""):
+        if pd.isna(val) or str(val).lower() == "nan": return fallback
+        return str(val)
+
+    genres = get_safe_str(row.get("genres", ""))
+    overview = get_safe_str(row.get("overview", ""))
+    directors = get_safe_str(row.get("directors", ""), "N/A")
+    cast = get_safe_str(row.get("cast", ""), "N/A")
     runtime = int(row.get("runtime", 0))
     revenue = float(row.get("revenue", 0))
     vote_count = int(row.get("numVotes", row.get("vote_count", 0)))
@@ -716,7 +950,7 @@ def render_movie_detail_panel(row, df_model, embeddings_list):
     with right_col:
         genre_badges = " ".join(
             f'<span class="badge-genre">{g.strip()}</span>'
-            for g in genres.split(",") if g.strip() and g.strip() != "nan"
+            for g in genres.split(",") if g.strip() and g.strip().lower() != "nan"
         )
         st.markdown(f'<p class="detail-title">{title}</p>', unsafe_allow_html=True)
         st.markdown(
@@ -765,11 +999,11 @@ def render_movie_card(row, col, card_key):
         sim_score = float(row.get("similarity_score", 0))
         year = int(row.get("release_year", 0))
         genres_raw = str(row.get("genres", ""))
-        genre_list = [g.strip() for g in genres_raw.split(",")][:2]
-        title = str(row.get("title", "Unknown"))
+        genre_list = [g.strip() for g in genres_raw.split(",") if g.strip() and g.strip().lower() != "nan"][:2]
+        title = str(row.get("display_title", "Unknown"))
 
         genre_html = "".join(
-            f'<span class="badge-genre">{g}</span>' for g in genre_list if g and g != "nan"
+            f'<span class="badge-genre">{g}</span>' for g in genre_list if g and g.lower() != "nan"
         )
         sim_badge = f'<span class="badge-score">🎯 {sim_score*100:.0f}%</span>' if sim_score > 0 else ""
         poster_html = (
@@ -924,6 +1158,7 @@ def render_dashboard(df_model):
     tab1, tab2, tab3, tab4 = st.tabs(["🎭 Genres", "⭐ Ratings", "📅 Timeline", "💰 Revenue"])
 
     genre_series = df_model["genres"].str.split(",").explode().str.strip()
+    genre_series = genre_series[genre_series.str.len() > 1] # Remove empty/invalid categories
 
     with tab1:
         col_left, col_right = st.columns(2)
@@ -1257,16 +1492,16 @@ def render_recommendation_page(df_model, embeddings_list):
         with r1c1:
             st.markdown("**🎭 Favourite Genres**")
             selected_genres = st.multiselect(
-                "Genres", ALL_GENRES, default=["Action", "Drama"],
+                "Genres", ALL_GENRES, default=[],
                 key="genre_select", label_visibility="collapsed", placeholder="Choose genres…",
             )
         with r1c2:
             st.markdown("**⭐ Minimum IMDB Rating**")
-            min_rating = st.slider("Min Rating", 0.0, 10.0, 6.0, 0.1,
+            min_rating = st.slider("Min Rating", 0.0, 10.0, 0.0, 0.1,
                                    label_visibility="collapsed", key="min_rating_slider")
         with r1c3:
             st.markdown("**📅 Release Year Range**")
-            min_year, max_year = st.slider("Year range", 1950, 2025, (2000, 2025), 1,
+            min_year, max_year = st.slider("Year range", 1900, 2025, (1900, 2025), 1,
                                            label_visibility="collapsed", key="year_range_slider")
         r2c1, r2c2, _ = st.columns([2, 2, 3])
         with r2c1:
@@ -1295,11 +1530,11 @@ def render_recommendation_page(df_model, embeddings_list):
                         'Explore currently viral and newly released titles trending across the platform.</p>', 
                         unsafe_allow_html=True)
             
-            # Get the highest-rated RECENT movies (2022+) to simulate "Viral/Current"
+            # Get the highest-rated movies to simulate "Viral/Current"
             rc_f = "averageRating" if "averageRating" in df_model.columns else "vote_average"
-            inspiration_df = df_model[df_model["release_year"] >= 2022].sort_values("score", ascending=False).head(8).copy()
+            inspiration_df = df_model.sort_values("score", ascending=False).head(8).copy()
             
-            # Fallback if no 2022+ movies (e.g. smaller test dataset)
+            # Fallback if no movies (shouldn't happen with valid dataset)
             if len(inspiration_df) < 4:
                 inspiration_df = df_model.sort_values(["release_year", "score"], ascending=False).head(8).copy()
                 
@@ -1315,46 +1550,100 @@ def render_recommendation_page(df_model, embeddings_list):
             key="vibe_search", label_visibility="collapsed"
         )
         
-        col_v1, col_v2 = st.columns([1, 4])
+        col_v1, col_v2, col_v3 = st.columns([1, 1.5, 2.5])
         with col_v1:
-            vibe_btn = st.button("🔍 Discover by Vibe", key="vibe_btn")
+            vibe_btn = st.button("🔍 Discover", key="vibe_btn", use_container_width=True)
+        with col_v2:
+            vibe_sort = st.selectbox("Sort Mode", ["🎲 Discovery (Random)", "⭐ Quality (Best Rated)"], 
+                                     index=0, label_visibility="collapsed", key="vibe_sort_order")
             
         if vibe_btn and vibe_query:
             with st.spinner("🧠 AI is dreaming up matches..."):
-                vibe_recs = get_semantic_recommendations(
-                    vibe_query, embeddings_list, df_model, top_n=10,
+                # Fetch a generous pool of results to support discovery
+                vibe_recs_df = get_semantic_recommendations(
+                    vibe_query, embeddings_list, df_model, top_n=100,
                     genre_filter=selected_genres, min_rating=min_rating,
                     min_year=min_year, max_year=max_year
                 )
-                st.session_state["vibe_recs"] = vibe_recs.to_dict("records") if len(vibe_recs) > 0 else []
+                
+                # Apply initial sorting based on user choice
+                if "Quality" in vibe_sort:
+                    vibe_recs_df = vibe_recs_df.sort_values("averageRating", ascending=False)
+                else:
+                    # Random discovery shuffle (Vibe-related but shuffled)
+                    vibe_recs_df = vibe_recs_df.sample(frac=1)
+                
+                st.session_state["vibe_recs"] = vibe_recs_df.to_dict("records") if not vibe_recs_df.empty else []
+                st.session_state["vibe_page"] = 0 # Reset to first page
                     
         vibe_recs_data = st.session_state.get("vibe_recs", [])
         if vibe_recs_data and vibe_query:
-            st.markdown(f'<p style="font-size:0.9rem; color:#facc15; margin-bottom:15px;">✨ Semantic matches for: "{vibe_query}"</p>', unsafe_allow_html=True)
-            render_movie_grid(pd.DataFrame(vibe_recs_data), cols_per_row=cols_per_row, section_prefix="vibe")
+            # ── PAGINATION LOGIC ─────────────────────────────────────────────
+            items_per_page = 12
+            total_items = len(vibe_recs_data)
+            total_pages = math.ceil(total_items / items_per_page)
+            current_page = st.session_state.get("vibe_page", 0)
+            
+            # Slice results for current page
+            start_idx = current_page * items_per_page
+            end_idx = start_idx + items_per_page
+            page_data = vibe_recs_data[start_idx:end_idx]
+            
+            st.markdown(f'<p style="font-size:0.9rem; color:#facc15; margin-bottom:15px;">'
+                        f'✨ Semantic matches: "{vibe_query}" (Page {current_page + 1} of {total_pages})</p>', 
+                        unsafe_allow_html=True)
+            
+            render_movie_grid(pd.DataFrame(page_data), cols_per_row=cols_per_row, section_prefix="vibe")
+            
+            # Navigation Buttons
+            if total_pages > 1:
+                p_c1, p_c2, p_c3 = st.columns([1, 1, 1])
+                with p_c1:
+                    if st.button("⬅️ Previous", disabled=(current_page == 0), key="vibe_prev", use_container_width=True):
+                        st.session_state.vibe_page -= 1
+                        st.rerun()
+                with p_c2:
+                    st.markdown(f"<p style='text-align:center; padding-top:10px; color:#71717a;'>{current_page+1} / {total_pages}</p>", unsafe_allow_html=True)
+                with p_c3:
+                    if st.button("Next ➡️", disabled=(current_page >= total_pages - 1), key="vibe_next", use_container_width=True):
+                        st.session_state.vibe_page += 1
+                        st.rerun()
 
     # ── Similar Movie Search Section ──────────────────────────────────────────
     with st.expander("🔍 Find Movies Similar To...", expanded=True):
         search_query = st.text_input(
-            "Search", value="", placeholder="🔎  Type a movie name to search…",
-            key="movie_search", label_visibility="collapsed",
+            "Search", value="", placeholder="🔎  Type to search (e.g. Interstellar)…",
+            key="movie_search_visual", label_visibility="collapsed",
         )
-        movie_list_sorted = sorted(df_model["title"].tolist())
-        filtered_movies = (
-            [m for m in movie_list_sorted if search_query.lower() in m.lower()]
-            if search_query else movie_list_sorted
-        )
-        if not filtered_movies:
-            st.warning("No movies match your search.")
-            filtered_movies = movie_list_sorted[:100]
+        
+        selected_movie = st.session_state.get("selected_movie_title")
+        
+        # ── VISUAL SEARCH GALLERY ───────────────────────────────────────────
+        if len(search_query) >= 3:
+            # Performance Optimization: Blitz-search on pre-lowered list 
+            # Limited to Top 100k movies for sub-10ms response time.
+            query_lower = search_query.lower()
+            
+            # High-speed Boolean Indexing (Regex=False for speed)
+            search_subset = df_model.head(100000) 
+            mask = search_subset["display_title_lower"].str.contains(query_lower, regex=False, na=False)
+            matches = search_subset[mask].head(8)
+            
+            if not matches.empty:
+                st.markdown(f'<p style="font-size:0.8rem; color:#94a3b8; margin-bottom:10px">'
+                            f'✨ Instant Results for "{search_query}". Click <b>🔎 Details</b> to select.</p>', 
+                            unsafe_allow_html=True)
+                render_movie_grid(matches, cols_per_row=4, section_prefix="search_visual")
+                st.markdown('<hr style="border:0;border-top:1px solid rgba(255,255,255,0.05);margin:10px 0 20px 0">', unsafe_allow_html=True)
+            elif len(search_query) > 4:
+                st.warning("No matches found. Try a different title or refine your search.")
 
-        selected_movie = st.selectbox(
-            "Select:", filtered_movies, key="movie_select", label_visibility="collapsed",
-            index=None, placeholder="🔎 Type to search movies..."
-        )
 
         if selected_movie:
-            sel_row = df_model[df_model["title"] == selected_movie].iloc[0]
+            # High-speed lookup using pre-cached mapping
+            indices = pd.Series(df_model.index, index=df_model["display_title"])
+            sel_idx = indices[selected_movie]
+            sel_row = df_model.iloc[sel_idx]
             rating_col = "averageRating" if "averageRating" in df_model.columns else "vote_average"
             ic1, ic2 = st.columns([1, 3])
             with ic1:
@@ -1574,7 +1863,8 @@ def main():
         top_init_slot.markdown("""
         <div style="text-align:center;padding:80px 20px">
            <h2 style="color:#facc15">🎬 CineMatch 2.0 Initializing...</h2>
-           <p style="color:#94a3b8">Preparing cinematic intelligence and movie dataset...</p>
+           <p style="color:#94a3b8">Step 1 of 2: Loading cinematic database (436,000+ titles)...</p>
+           <div style="margin-top:20px; color:#52525b; font-size:0.85rem"><i>This only happens on the first run.</i></div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -1601,12 +1891,22 @@ def main():
     current_page = st.session_state.get("page", "recommend")
     if SENTENCE_TRANSFORMER_AVAILABLE:
         # Pinned to the top slot for maximum visibility
-        with top_init_slot:
-            embeddings_list = compute_embeddings(df_model)
+        if "ai_ready" not in st.session_state:
+            with top_init_slot:
+                st.markdown("""
+                <div style="text-align:center;padding:20px 20px 0 20px">
+                   <h3 style="color:#7c3aed">🤖 Step 2 of 2: AI Vectorization</h3>
+                   <p style="color:#94a3b8; font-size:0.9rem">CineMatch is learning the "vibe" of 436,000 movies. This may take 10-15 minutes on first run.</p>
+                </div>
+                """, unsafe_allow_html=True)
+                embeddings_list = compute_embeddings(df_model)
             
-        if embeddings_list is not None:
-            st.session_state["ai_ready"] = True
-            top_init_slot.empty() # Clear top slot once AI is ready
+            if embeddings_list is not None:
+                st.session_state["ai_ready"] = True
+                top_init_slot.empty() # Clear top slot once AI is ready
+        else:
+            # Already ready, just retrieve (cached)
+            embeddings_list = compute_embeddings(df_model)
     else:
         with st.sidebar:
             st.warning("⚠️ sentence-transformers not installed.\nRun: `pip install sentence-transformers`")
