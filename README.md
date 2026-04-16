@@ -87,8 +87,28 @@ python scripts/install_data.py
 streamlit run src/app.py
 ```
 
-> [!IMPORTANT]
-> **GPU Hardware Acceleration**: CineMatch automatically detects **NVIDIA CUDA** drivers. If a GPU is found, the 10-minute "Vectorization" phase is shortened to ~3 minutes. This happens only on the first run.
+---
+
+## 🚀 GPU Acceleration Setup
+
+If the application displays **🖥️ CPU Mode** in the sidebar, or runs slowly, you need to install the CUDA-enabled version of PyTorch.
+
+### Manual Fix (Windows/NVIDIA)
+1. **Activate Environment**:
+   ```powershell
+   .\venv\Scripts\activate
+   ```
+2. **Uninstall CPU Version**:
+   ```powershell
+   pip uninstall torch torchvision -y
+   ```
+3. **Reinstall with CUDA 12.1 support**:
+   ```powershell
+   pip install torch torchvision --extra-index-url https://download.pytorch.org/whl/cu121
+   ```
+
+> [!NOTE]
+> If you have an older NVIDIA GPU, replace `cu121` with `cu118` in the command above.
 
 ---
 
