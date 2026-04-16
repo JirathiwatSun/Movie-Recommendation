@@ -34,7 +34,15 @@ html, body, [class*="css"] {
 footer { visibility: hidden; }
 header [data-testid="stToolbar"] { visibility: hidden; }
 header { background: transparent !important; }
-[data-testid="collapsedControl"] { visibility: visible !important; display: flex !important; }
+
+/* Ensure Sidebar Toggle and Collapse buttons are always visible in modern Streamlit */
+[data-testid="stSidebarCollapse"],
+[data-testid="stSidebarExpand"],
+[data-testid="collapsedControl"] { 
+    visibility: visible !important; 
+    display: flex !important;
+}
+
 [data-testid="stSidebarNav"] { display: flex; }
 
 /* ══════════════════════════════════════

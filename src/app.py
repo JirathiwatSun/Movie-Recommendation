@@ -1820,8 +1820,7 @@ def main():
             
             # Disable buttons while seeding AI to prevent work interruption
             if st.button(button_label, key=f"nav_{page_id}", 
-                        use_container_width=True, 
-                        disabled=is_initializing):
+                        use_container_width=True):
                 st.session_state.page = page_id
                 st.session_state.pop("selected_movie_detail", None)
                 st.rerun()
